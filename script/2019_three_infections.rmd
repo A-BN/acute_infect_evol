@@ -1,0 +1,1254 @@
+---
+title: "2019 Three Infections"
+author: "antoine.bridier-nahmias@inserm.fr"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
+
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+---
+
+Results will be compiled here:
+
+# Packages and data loading
+## Packages
+```{r setup}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(DT)
+library(kableExtra)
+library(ggplot2)
+library(cowplot)
+library(ggrepel)
+library(ggtree)
+library(survival)
+library(survminer)
+library(gggenes)
+library(ggnewscale)
+# library()
+source("./phylo_funk.r")
+theme_set(theme_cowplot())
+```
+
+## Data
+The mutations are all presented in a data_frame (tsv) containing the following 
+variables (most should be self explanatory):
+
+- **patient:** patient id; 
+- **subclon:** sub-clone id
+- **aa_new_seq:**
+- **aa_position:**
+- **aa_ref_seq:**
+- **codon_new_seq:**
+- **codon_ref_seq:**
+- **seq_id:** contig number (might not be kept in the final table).
+- **mut_size**
+- **position**
+- **gene_name**
+- **gene_position**
+- **gene_product**
+- **snp_type**: One of `synonymous, nonsynonymous, nonsense, intergenic`.
+- **type**: One of `SNP, DEL, INS, SUB`.
+- **synonymous**: Is the substitution synonymous (`TRUE/FALSE`)?
+- **Remarks**
+- **phase_disrupt**: Does the mutation disrupt an ORF: (`TRUE/FALSE`)?
+
+```{r data_loading, message=FALSE}
+all_mut =
+  read_tsv(file = "../data/variants/tables/all_mutations_final.tsv")
+
+# all isolates
+isolates <- data.frame(stringsAsFactors = F,
+  patient_11 = c("4248", "4254", "4249", "4252", "4253", "4251", "4250"),
+  patient_13 = c("4428", "4434", "4431", "4433", "4432", "4430", "4429"),
+  patient_17 = c("5-36", "5-40", "5-41", "5-38", "5-39", "5-34", "5-35"))
+
+# mutators isolates
+mutators <- c(p_11_mutator = "4254",
+              p_13_mutator = "4433",
+              p_17_mutator = "5-36")
+
+```
+
+# Exploratory data analysis
+## Reader Friendly table
+
+We might want to compute the following in order to _invert_ mutations present in
+more than half the subclons.
+
+`tot_subclon` : total number of subclon by patient (always 7 but we compute it
+nevertheless)
+`in_n_subclon` : For a specific mutation, in how many sublcon it is found in a
+patient
+```{r friendly_table}
+friendly_all_mut <-
+all_mut %>% 
+  rowwise() %>% 
+  mutate(subclon_  = str_split(string = subclon, pattern = "\\|", simplify = F)) %>% 
+  mutate(subclon__ = list(isolates[ ,patient])) %>%
+  mutate(reverse = length(subclon_) > ( length(subclon__) / 2)) %>%
+  mutate(isolates = if_else(condition = reverse, 
+      true = list(subclon__[! subclon__ %in% subclon_]),
+      false = list(subclon_))) %>% 
+  mutate(isolates = str_flatten(isolates, collapse = "|")) %>% 
+  select(-c("subclon", "subclon_", "subclon__", "reverse", "codon_new_seq", "codon_ref_seq", "seq_id")) %>% 
+  select(patient, isolates, everything()) %>% 
+  datatable(caption = "Mutations Table", 
+            filter = "top",
+            class = "cell-border stripe compact", 
+            extensions = c("Buttons", "FixedHeader"),
+            options = list( dom = 'lfrtip B',
+                            buttons = c("copy","csv"),
+                            fixedHeader = TRUE)) 
+friendly_all_mut
+DT::saveWidget(widget = friendly_all_mut, file = "./2020-all_mutations.html")
+
+```
+
+## Basic figures
+Here are a few simple figures (mutations counts) characterizing the data:
+```{r}
+
+indel_threshold <- 50 # from Gonzalez et al., 2007
+
+all_mut %>%
+  mutate(patient = "all") %>%
+  rbind(all_mut) %>% 
+  group_by(patient) %>% 
+  mutate(n_mut_total = n()) %>% 
+  # SNP
+  mutate(n_SNP_total = sum(type == "SNP", na.rm = TRUE)) %>%
+  mutate(n_SNP_synonymous = sum(snp_type == "synonymous", na.rm = TRUE)) %>% 
+  mutate(n_SNP_nonsynonymous = sum(snp_type == "nonsynonymous", na.rm = TRUE)) %>%
+  mutate(n_SNP_nonsense = sum(snp_type == "nonsense", na.rm = TRUE)) %>%
+  mutate(n_SNP_intergenic = sum(snp_type == "intergenic", na.rm = TRUE)) %>%
+  # INDEL
+  mutate(n_INDEL_small_total = sum(type %in% c("INS", "DEL") & mut_size < indel_threshold)) %>%
+  mutate(n_INDEL_small_intergenic = sum(type %in% c("INS", "DEL") & mut_size < indel_threshold & str_detect(string = gene_position, pattern = "^intergenic.*"))) %>%
+  mutate(n_INDEL_small_frameshift = sum(type %in% c("INS", "DEL") & mut_size < indel_threshold & mut_size %% 3 != 0)) %>%
+  mutate(n_INDEL_small_noframeshift = sum(type %in% c("INS", "DEL") & mut_size < indel_threshold & mut_size %% 3 == 0)) %>%
+  mutate(n_INDEL_large_total = sum(type %in% c("INS", "DEL") & mut_size > indel_threshold)) %>%
+  select(patient, starts_with(match = "n_")) %>%
+  slice(1) %>%
+  identity() -> basic_figures
+
+# basic_figures
+basic_figs <- 
+basic_figures %>% 
+  select(patient, n_mut_total, n_INDEL_large_total, n_INDEL_small_intergenic, 
+         n_SNP_intergenic, n_INDEL_small_noframeshift, n_INDEL_small_frameshift, 
+         n_SNP_nonsense, n_SNP_nonsynonymous,
+         n_SNP_synonymous) %>% 
+  kable(col.names = rep("", ncol(.))) %>%
+    kable_styling(bootstrap_options = c("striped", "bordered"), full_width = TRUE) %>%
+    add_header_above(header = c("Patient" = 1, "Total" = 1, "Large del" = 1, 
+                                 "Indel" = 1, "SNP" = 1, "In frame" = 1, 
+                                "Frameshift" = 1,"NonSens" = 1, 
+                                "NonSynonymous" = 1, "Synonymous" = 1)) %>% 
+    add_header_above(header = c(" " = 3, "Intergenic" = 2,"INDEL" = 2, "SNP" = 3)) %>% 
+    add_header_above(header = c(" " = 5, "Genic" = 5))
+
+mut_no_mut <- 
+  all_mut %>% 
+  group_by(patient) %>% 
+  mutate(total_mut = n()) %>% 
+  filter(subclon %in% c("4254", "4433", "5-36")) %>% 
+  mutate(mutator_mut = n()) %>% 
+  slice(1) %>% 
+  select(patient, total_mut, mutator_mut)
+
+mut_no_mut_size_1 <- 
+  all_mut %>% 
+  group_by(patient) %>% 
+  filter(mut_size == 1) %>% 
+  mutate(total_mut = n()) %>% 
+  filter(subclon %in% c("4254", "4433", "5-36")) %>% 
+  mutate(mutator_mut = n()) %>% 
+  slice(1) %>% 
+  select(patient, total_mut, mutator_mut)
+
+basic_figs
+mut_no_mut
+# write_tsv(x = basic_figs, path = "../docs/Tables/mut_types.tsv")
+```
+Table 1: Mutationnal events occuring in _E. coli_ clones isolated from three
+extra-intestinal infections.
+INDEL larger than `r indel_threshold` were considered as large.
+
+## Convergent evolution
+Intra- and inter-host:
+We count as convergent mutation an independent mutation in the same gene.
+Working on operon is too convoluted to be easily computed.
+
+We'll start by creating the table for SNP mutations only and then update the
+counts with results from the deletion and maybe, sadly, a manual curation step.
+
+The gene names finishing in the `"_[1-9]"` pattern are potential duplications 
+annotated by prokka. Since they are the same genes, we'll group them together 
+by eliminating the pattern from `gene_name`.
+
+
+
+`n_time_in_patient` : For a gene, how many times it is mutated per patient
+`in_n_patients` : For a mutated gene, in how many different patient can it be 
+found
+
+```{r}
+
+# Identifying convergence in non intergenic SNPs and small INDELs
+
+large_del_inter_pattern <- "[–\\/\\[]" # the / is a sign of intergenic_mutation
+
+all_mut %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                                 pattern = "(.*)_[0-9]{1,2}$",
+                                 replacement = "\\1")) %>%
+  filter((type == "SNP" & snp_type != "intergenic") | 
+           (type %in% c("DEL", "INS")) & 
+           !str_detect(string = gene_name, pattern = large_del_inter_pattern)) %>% 
+  select(patient, gene_name, gene_product, type) -> convergent_snp_long
+
+
+
+# Identifying convergence in large deletions:
+large_deletion_pattern <- "[–\\[]" # the / is in fact a sign of intergenic_mutation
+all_mut %>% 
+  filter(str_detect(string = gene_name, pattern = large_deletion_pattern)) %>% 
+  identity() -> del_mut
+
+convergent_del <- tibble(patient = "", gene_name = "")
+for (i in 1:nrow(del_mut)) {
+  curr_del <- del_mut[i, ]
+  out_del <- tibble(patient = curr_del$patient, gene_name = curr_del$gene_product)
+  convergent_del <- rbind(convergent_del, out_del)
+}
+convergent_del <- convergent_del[2:nrow(convergent_del),]
+
+
+convergent_del %>%
+  mutate(del_id = paste0("DEL_",row_number())) %>% 
+  mutate(gene_name = str_remove_all(string = gene_name, pattern = "[\\[\\]]")) %>% 
+  mutate(gene_name = str_remove_all(string = gene_name, pattern = "<.*R>")) %>% 
+  mutate(gene_name = str_remove_all(string = gene_name, pattern = "<\\/i>")) %>%
+  separate(col = gene_name, into = paste0("A", 1:50), sep = ",") %>% 
+  gather(key = "useless", value = "gene_name", -patient, -del_id) %>%
+  mutate(gene_name = trimws(gene_name)) %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                                 pattern = "(.*)_[0-9]{1,2}$",
+                                 replacement = "\\1")) %>%
+  mutate(gene_name = str_replace_all(string = gene_name,
+                                 pattern = "\u2011",
+                                 replacement = "-")) %>% # 0x2011 is the HEX for "non-breaking hyphen"
+  
+  filter(!is.na(gene_name)) %>% 
+  mutate(gene_product = "" , type = "Large_DEL") %>%
+  # Eliminating 'duplicated' genes found in the same deletion e.g ynfK
+  group_by(del_id, gene_name) %>%
+  slice(1) %>% 
+  ungroup() %>%
+  select(-useless, -del_id) %>%
+  identity() -> convergent_del_long
+
+convergent_all_long <-
+  rbind(convergent_snp_long, convergent_del_long)
+
+
+convergent_all_long %>% 
+  # mutate(mut_id = paste0("mut", 1:n())) %>%
+  group_by(gene_name) %>%
+  mutate(in_n_patient = length(unique(patient))) %>%
+  group_by(patient, gene_name) %>% 
+  mutate(n_time_in_patient = n()) %>%
+  ungroup() %>% 
+  # summarize
+  group_by(gene_name) %>% 
+  mutate_at(.vars = c("gene_product", "type"), 
+            .funs = function(x) paste0(unique(x), collapse = "; ")) %>%
+  ungroup() %>% 
+  group_by(patient, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>%
+  # filter out non convergent mutations
+  filter(in_n_patient > 1 | n_time_in_patient > 1) %>% 
+  identity() -> convergent_all_long
+
+
+
+convergent_all_long %>% 
+  select(patient, gene_name, gene_product, type, n_time_in_patient) %>% 
+  spread(key = patient, value = n_time_in_patient, fill = 0) %>% 
+  mutate(total = patient_11 + patient_13 + patient_17) %>%
+  # almost 100 mut are convergent only in patient_17 large deletions
+  # filtering out all mutation (type == "Large_DEL") only present in one patient.
+  rowwise() %>% 
+  filter(!(type == "Large_DEL" & (sum(patient_11 != 0, patient_13 != 0, patient_17 != 0) == 1))) %>% 
+  ungroup() %>% 
+  arrange(desc(total)) %>%
+  identity() -> convergent_all
+
+# unwanted_genes <- c("insC.*","insA.*", "ydf.*", "dic.*", "rzp.*", "yda.*","FOBKHAMO.*", "JJGPNMLM.*")
+unwanted_genes <- c("insC.*","insA.*", "ydf.*", "dic.*", "rzp.*", "yda.*")
+is_wanted <- 
+  sapply(X = convergent_all$gene_name, 
+         FUN = function(x) sum(str_detect(string = x, pattern = unwanted_genes)) == 0)
+
+convergent_all %>% 
+  filter(is_wanted) -> convergent_all_filtered
+
+# Manually adding some gene description
+descriptions <- list(
+  mutS = "MutHLS complex, methyl-directed mismatch repair",
+  pphB = "protein-tyrosine-phosphatase / phosphoprotein phosphatase",
+  ygbI = "putative DNA-binding transcriptional regulator, DEOR-type"
+)
+
+for (i in 1:nrow(convergent_all_filtered)) {
+  if (convergent_all_filtered$gene_product[i] == "") {
+    convergent_all_filtered$gene_product[i] <-
+      descriptions[[convergent_all_filtered$gene_name[i]]]
+  }
+}
+
+
+# Final printing
+kable(convergent_all_filtered, caption = "Convergence") %>%
+  kable_styling(bootstrap_options = c("bordered"), full_width = FALSE)
+write_tsv(x = convergent_all_filtered, path = "../docs/Tables/convergence.tsv")
+```
+
+```{r}
+# convergence within
+convergent_all_filtered %>%
+  select_at(dplyr::vars(starts_with("patient"))) %>% 
+  mutate_all(.funs = function(x) sum(x[x > 1])) %>%
+  slice(1) %>% 
+  t() %>% 
+  as.data.frame() %>%
+  dplyr::rename(convergent = V1) %>% 
+  mutate(patient = rownames(.)) %>% 
+  select(patient, convergent) %>% 
+  left_join(y = mut_no_mut, by = c("patient")) %>% 
+  mutate(perc_conv_tot = round(convergent / total_mut, 2)) %>%
+  mutate(perc_conv_tot_nomut = round(convergent / (total_mut - mutator_mut), 2)) %>%
+  identity() -> converge_within
+
+# convergence between
+convergent_all_filtered %>%
+  select(-gene_product, -type, -total) %>% 
+  mutate_at(.vars = dplyr::vars(starts_with("patient")), 
+            .funs = list(conv = function(x) x > 0)) %>%
+  mutate(n_convergent = rowSums(select(., ends_with("_conv")))) %>% 
+  select_at(.vars = dplyr::vars(-ends_with("_conv"))) %>% 
+  filter(n_convergent > 1) -> converge_between_full
+
+
+convergent_all_filtered %>%
+  select_at(dplyr::vars(starts_with("patient"))) %>%
+  rowwise() %>% 
+  mutate(between = sum(patient_11 == 0,patient_13 == 0, patient_17 == 0) < 2) %>% 
+  ungroup() %>% 
+  filter(between == TRUE) %>%
+  select(-between) %>%
+  summarise_all(sum) %>% 
+  t() %>% 
+  as.data.frame() %>%
+  dplyr::rename(convergent = V1) %>% 
+  mutate(patient = rownames(.)) %>% 
+  select(patient, convergent) %>% 
+  left_join(y = mut_no_mut, by = c("patient")) %>% 
+  mutate(perc_conv_tot = round(convergent / total_mut, 2)) %>%
+  mutate(perc_conv_tot_nomut = round(convergent / (total_mut - mutator_mut), 2)) %>%
+  identity() -> converge_between
+
+# Part of convergence due to the mutators
+all_mut %>% 
+  filter(subclon %in% mutators) %>% 
+  filter(gene_name %in% convergent_all_filtered$gene_name | 
+           gene_product %in% convergent_all_filtered$gene_name) %>%
+  identity() -> convergence_mutators
+
+# Pretty print
+kable(converge_within, caption = "Convergence Within Patients") %>%
+  kable_styling(bootstrap_options = c("bordered", "striped"), full_width = FALSE)
+
+kable(converge_between, caption = "Convergence Between Patients") %>%
+  kable_styling(bootstrap_options = c("bordered", "striped"), full_width = FALSE)
+
+```
+
+
+
+# Population genetics calculations
+## Thetas and Tajima's D
+Here is calculated (excluding the mutators):
+
+- `watt` : $\theta _{Watterson}$ or $S$, the number of segregating sites
+- `pi  ` : ${\pi}$, the pairwise differences between subclones
+- `D   ` : $\frac{d}{\sqrt{\hat{V}_{d}}}$, Tajima's D with $d={\pi} - \theta _{W}$
+
+```{r pop_genet}
+source("./make_variants.r")
+p_watt <- sapply(FUN = get, X = apropos(what = "^p_.._watt$"))
+
+p_pi <- sapply(FUN = get, X = apropos(what = "^p_.._pi$"))
+
+p_D <-  as.data.frame(sapply(FUN = get, X = apropos(what = "^p_.._D$")))
+val <- rownames(p_D)
+p_D %>% 
+  mutate_all(as.numeric) %>% 
+  mutate(val = val) %>% 
+  select(val, everything()) -> p_D
+
+p_watt
+p_pi
+kable(p_D) %>% kable_styling(full_width = FALSE)
+```
+
+## Ka/Ks | dNdS
+Creating the correct mutation format for O. Tenaillon's perl script.
+The header is self explanatory:
+S = synonymous NS = non-synonymous; the letters represent the substitution.
+__S_AT_CG S_AT_GC S_AT_TA S_CG_GC S_CG_TA S_GC_TA NS_AT_CG NS_AT_GC NS_AT_TA NS_CG_GC NS_CG_TA NS_GC_TA__
+
+We will exclude the mutator from these computations.
+```{r}
+all_mut %>%
+  filter(!(subclon %in% mutators)) %>% 
+  # finding the nucleotides substituted in each SNP
+  filter(type == "SNP", snp_type == "synonymous" | snp_type == "nonsynonymous" ) %>%
+  rowwise() %>% 
+  mutate(nuc_ref = codon_compare(cod_ref = codon_ref_seq, cod_mut = codon_new_seq)[[1]]) %>% 
+  mutate(nuc_mut = codon_compare(cod_ref = codon_ref_seq, cod_mut = codon_new_seq)[[2]]) %>%
+  ungroup() %>%
+  # Counting all 12 possible mutations types
+  # Synonymous
+  mutate(S_AT_CG = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "C") | (nuc_ref == "T" & nuc_mut == "G"))) %>%
+  mutate(S_AT_GC = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "G") | (nuc_ref == "T" & nuc_mut == "C"))) %>%
+  mutate(S_AT_TA = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "T") | (nuc_ref == "T" & nuc_mut == "A"))) %>%
+  mutate(S_CG_GC = synonymous == TRUE & ((nuc_ref == "C" & nuc_mut == "G") | (nuc_ref == "G" & nuc_mut == "C"))) %>%
+  mutate(S_CG_TA = synonymous == TRUE & ((nuc_ref == "C" & nuc_mut == "T") | (nuc_ref == "G" & nuc_mut == "A"))) %>%
+  mutate(S_GC_TA = synonymous == TRUE & ((nuc_ref == "G" & nuc_mut == "T") | (nuc_ref == "C" & nuc_mut == "A"))) %>%
+  # Non synonymous
+  mutate(NS_AT_CG = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "C") | (nuc_ref == "T" & nuc_mut == "G"))) %>%
+  mutate(NS_AT_GC = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "G") | (nuc_ref == "T" & nuc_mut == "C"))) %>%
+  mutate(NS_AT_TA = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "T") | (nuc_ref == "T" & nuc_mut == "A"))) %>%
+  mutate(NS_CG_GC = synonymous == FALSE & ((nuc_ref == "C" & nuc_mut == "G") | (nuc_ref == "G" & nuc_mut == "C"))) %>%
+  mutate(NS_CG_TA = synonymous == FALSE & ((nuc_ref == "C" & nuc_mut == "T") | (nuc_ref == "G" & nuc_mut == "A"))) %>%
+  mutate(NS_GC_TA = synonymous == FALSE & ((nuc_ref == "G" & nuc_mut == "T") | (nuc_ref == "C" & nuc_mut == "A"))) %>%
+  # Summarizing
+  group_by(patient) %>%
+  select(patient,S_AT_CG:NS_GC_TA) %>% 
+  summarise_all(sum) %>% 
+  identity() -> all_mut_count
+
+write_tsv(x = all_mut_count[1, 2:13], path = "../data/variants/tables/patient_11_kaks.input", col_names = FALSE)
+write_tsv(x = all_mut_count[2, 2:13], path = "../data/variants/tables/patient_13_kaks.input", col_names = FALSE)
+write_tsv(x = all_mut_count[3, 2:13], path = "../data/variants/tables/patient_17_kaks.input", col_names = FALSE)
+```
+
+
+The gff files had to be manually 'decapitated and squished': the header had to be removed
+and the genome was 'squished' into a unique contig with the gene positions corrected.
+
+```{r}
+calc_kaks <- FALSE
+
+if (calc_kaks) {
+  system("touch mock_mask")
+  
+  patient_11_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_11/annotation/patient_11_squished.gff ../data/variants/tables/patient_11_kaks.input ./mock_mask"
+  # patient_11_kaks_out <- system(command = patient_11_kaks_command, intern = TRUE)
+  # patient_11_kaks <- as.numeric(tail(patient_11_kaks_out, n = 1))
+  patient_11_kaks <- 0
+  
+  patient_13_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_13/annotation/patient_13_squished.gff ../data/variants/tables/patient_13_kaks.input ./mock_mask"
+  patient_13_kaks_out <- system(command = patient_13_kaks_command, intern = TRUE)
+  patient_13_kaks <- as.numeric(tail(patient_13_kaks_out, n = 1))
+  
+  patient_17_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_17/annotation/patient_17_squished.gff ../data/variants/tables/patient_17_kaks.input ./mock_mask"
+  patient_17_kaks_out <- system(command = patient_17_kaks_command, intern = TRUE)
+  patient_17_kaks <- as.numeric(tail(patient_17_kaks_out, n = 1))
+  
+  
+  system("rm mock_mask")
+  system("rm ECBGenesCDS.txt")
+  system("rm GenomeComposition.txt")
+}
+
+# Value from previous run:
+patient_11_kaks <- "+ Inf"
+patient_13_kaks <- 3.46
+patient_17_kaks <- 5.09
+```
+
+Ka/Ks :
+
+- Patient 11: `r patient_11_kaks`
+- Patient 13: `r patient_13_kaks`
+- Patient 17: `r patient_17_kaks`
+
+
+
+
+
+As an 'exercise in style' we will compute these Kaks for the mutator only:
+```{r, }
+
+calc_kaks <- FALSE
+
+if (calc_kaks) {
+  
+all_mut %>%
+  filter((subclon %in% mutators)) %>% 
+  # finding the nucleotides substituted in each SNP
+  filter(type == "SNP", snp_type == "synonymous" | snp_type == "nonsynonymous" ) %>%
+  rowwise() %>% 
+  mutate(nuc_ref = codon_compare(cod_ref = codon_ref_seq, cod_mut = codon_new_seq)[[1]]) %>% 
+  mutate(nuc_mut = codon_compare(cod_ref = codon_ref_seq, cod_mut = codon_new_seq)[[2]]) %>%
+  ungroup() %>%
+  # Counting all 12 possible mutations types
+  # Synonymous
+  mutate(S_AT_CG = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "C") | (nuc_ref == "T" & nuc_mut == "G"))) %>%
+  mutate(S_AT_GC = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "G") | (nuc_ref == "T" & nuc_mut == "C"))) %>%
+  mutate(S_AT_TA = synonymous == TRUE & ((nuc_ref == "A" & nuc_mut == "T") | (nuc_ref == "T" & nuc_mut == "A"))) %>%
+  mutate(S_CG_GC = synonymous == TRUE & ((nuc_ref == "C" & nuc_mut == "G") | (nuc_ref == "G" & nuc_mut == "C"))) %>%
+  mutate(S_CG_TA = synonymous == TRUE & ((nuc_ref == "C" & nuc_mut == "T") | (nuc_ref == "G" & nuc_mut == "A"))) %>%
+  mutate(S_GC_TA = synonymous == TRUE & ((nuc_ref == "G" & nuc_mut == "T") | (nuc_ref == "C" & nuc_mut == "A"))) %>%
+  # Non synonymous
+  mutate(NS_AT_CG = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "C") | (nuc_ref == "T" & nuc_mut == "G"))) %>%
+  mutate(NS_AT_GC = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "G") | (nuc_ref == "T" & nuc_mut == "C"))) %>%
+  mutate(NS_AT_TA = synonymous == FALSE & ((nuc_ref == "A" & nuc_mut == "T") | (nuc_ref == "T" & nuc_mut == "A"))) %>%
+  mutate(NS_CG_GC = synonymous == FALSE & ((nuc_ref == "C" & nuc_mut == "G") | (nuc_ref == "G" & nuc_mut == "C"))) %>%
+  mutate(NS_CG_TA = synonymous == FALSE & ((nuc_ref == "C" & nuc_mut == "T") | (nuc_ref == "G" & nuc_mut == "A"))) %>%
+  mutate(NS_GC_TA = synonymous == FALSE & ((nuc_ref == "G" & nuc_mut == "T") | (nuc_ref == "C" & nuc_mut == "A"))) %>%
+  # Summarizing
+  group_by(patient) %>%
+  select(patient,S_AT_CG:NS_GC_TA) %>% 
+  summarise_all(sum) %>% 
+  identity() -> mutator_mut_count
+
+write_tsv(x = mutator_mut_count[1, 2:13], path = "../data/variants/tables/patient_11_mutator_kaks.input", col_names = FALSE)
+write_tsv(x = mutator_mut_count[2, 2:13], path = "../data/variants/tables/patient_13_mutator_kaks.input", col_names = FALSE)
+write_tsv(x = mutator_mut_count[3, 2:13], path = "../data/variants/tables/patient_17_mutator_kaks.input", col_names = FALSE)
+
+
+
+  system("touch mock_mask")
+  
+  patient_11_mutator_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_11/annotation/patient_11_squished.gff ../data/variants/tables/patient_11_mutator_kaks.input ./mock_mask"
+  patient_11_mutator_kaks_out <- system(command = patient_11_mutator_kaks_command, intern = TRUE)
+  patient_11_mutator_kaks <- as.numeric(tail(patient_11_mutator_kaks_out, n = 1))
+  
+  
+  patient_13_mutator_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_13/annotation/patient_13_squished.gff ../data/variants/tables/patient_13_mutator_kaks.input ./mock_mask"
+  patient_13_mutator_kaks_out <- system(command = patient_13_mutator_kaks_command, intern = TRUE)
+  patient_13_mutator_kaks <- as.numeric(tail(patient_13_mutator_kaks_out, n = 1))
+  
+  patient_17_mutator_kaks_command <-
+    "perl ./kaks_OT/GenomeCompositionComputer_abn.pl ../data/reference/patient_17/annotation/patient_17_squished.gff ../data/variants/tables/patient_17_mutator_kaks.input ./mock_mask"
+  patient_17_mutator_kaks_out <- system(command = patient_17_mutator_kaks_command, intern = TRUE)
+  patient_17_mutator_kaks <- as.numeric(tail(patient_17_mutator_kaks_out, n = 1))
+  
+  
+  system("rm mock_mask")
+  system("rm ECBGenesCDS.txt")
+  system("rm GenomeComposition.txt")
+}
+
+# Value from previous run:
+patient_11_mutator_kaks <- 0.52
+patient_13_mutator_kaks <- 0.93
+patient_17_mutator_kaks <- 1.35
+
+```
+Mutators Ka/Ks :
+
+- Patient 11: `r patient_11_mutator_kaks`
+- Patient 13: `r patient_13_mutator_kaks`
+- Patient 17: `r patient_17_mutator_kaks`
+
+## Phylogenetic trees
+
+```{r}
+ref_subclon <- c(patient_11 = "4250", patient_13 = "4429", patient_17 = "5-35" ) 
+
+
+
+all_mut %>%
+  group_by(patient) %>% 
+  mutate(subclon_all = paste0(subclon, collapse = "|")) %>% 
+  mutate(subclon_all = str_split(string = subclon_all, pattern = "\\|")) %>%
+  slice(1) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  # mutate(subclon_all = list(unique(subclon_all))) %>% 
+  mutate(subclon_all = case_when(
+    patient == "patient_11" ~ list(c(unique(subclon_all), ref_subclon["patient_11"])),
+    patient == "patient_13" ~ list(c(unique(subclon_all), ref_subclon["patient_13"])),
+    patient == "patient_17" ~ list(c(unique(subclon_all), ref_subclon["patient_17"]))
+  )) %>% 
+  select(subclon_all, patient) -> subclon_df
+
+patient_11_matrix <-
+  make_mut_matrix(mut_table = filter(all_mut, patient == "patient_11"), subclon_names = subclon_df$subclon_all[[1]])
+patient_13_matrix <-
+  make_mut_matrix(mut_table = filter(all_mut, patient == "patient_13"), subclon_names = subclon_df$subclon_all[[2]])
+patient_17_matrix <-
+  make_mut_matrix(mut_table = filter(all_mut, patient == "patient_17"), subclon_names = subclon_df$subclon_all[[3]])
+```
+
+
+```{r}
+patient_11_tree <-
+  nj(dist(t(patient_11_matrix), upper = TRUE, diag = TRUE, method = "manhattan"))
+patient_11_tree$tip.label[patient_11_tree$tip.label == "4254"] <- "4254*"
+
+patient_13_tree <-
+  nj(dist(t(patient_13_matrix), upper = TRUE, diag = TRUE, method = "manhattan"))
+patient_13_tree$tip.label[patient_13_tree$tip.label == "4433"] <- "4433*"
+
+patient_17_tree <-
+  nj(dist(t(patient_17_matrix), upper = TRUE, diag = TRUE, method = "manhattan"))
+patient_17_tree$tip.label[patient_17_tree$tip.label == "5-36"] <- "5-36*"
+
+plot(patient_11_tree, type = "unrooted")
+add.scale.bar()
+plot(patient_13_tree, type = "unrooted")
+add.scale.bar()
+plot(patient_17_tree, type = "unrooted")
+add.scale.bar()
+save_plot(plot = {plot(patient_11_tree, type = "unrooted"); add.scale.bar()}, filename = "../docs/Figs/trees/p_11_tree.pdf")
+save_plot(plot = {plot(patient_13_tree, type = "unrooted"); add.scale.bar()}, filename = "../docs/Figs/trees/p_13_tree.pdf")
+save_plot(plot = {plot(patient_17_tree, type = "unrooted"); add.scale.bar()}, filename = "../docs/Figs/trees/p_17_tree.pdf")
+# tidytree::as_tibble(patient_11_tree)
+# list_tree <- 
+#   list(Patient_11 = unroot(phy = patient_11_tree), 
+#        Patient_13 = unroot(phy = patient_13_tree),
+#        Patient_17 = unroot(phy = patient_17_tree))
+# 
+# class(list_tree) <- "multiPhylo"
+# 
+# ggtree(tr = list_tree, layout = "daylight") + # other layout: equal_angle
+#   geom_tiplab(hjust = 0) +
+#   geom_treescale() +
+#   facet_wrap(~.id, scales = "free")
+
+# 
+# ggtree(patient_11_tree, aes(x,y), layout = "eq") +
+#   geom_text(aes(x = ifelse(x >= -2, x + 0.6, x - 0.6), 
+#                 label = c(patient_11_tree$tip.label, rep(NA, 5)))) +
+#   # geom_tiplab2(offset = -0.6) +
+#   geom_treescale(width = 1) +
+#   # xlim(-10,10) +
+#   # ylim(-3,16) +
+#   theme_tree()
+# 
+# ggtree(patient_11_tree, aes(x,y), layout = "eq") + 
+#   geom_tippoint() +
+#   geom_tiplab2(hjust = 0, colour = "grey", fontface = "bold", family = "mono", size = 5) +
+#   geom_tiplab2(hjust = 0, colour = "black", family = "mono", size = 5) +
+#   geom_treescale(width = 1) +
+#   expand_limits(x = 0, y = -5)+
+#   theme_tree() +
+#   geom_blank()
+#   
+#   
+# ggtree(patient_13_tree, aes(x,y), layout = "day") + 
+#   geom_tippoint() +
+#   geom_tiplab2(hjust = 0, colour = "grey", fontface = "bold", family = "mono", size = 5) +
+#   geom_tiplab2(hjust = 0, colour = "black", family = "mono", size = 5) +
+#   geom_treescale(width = 1) +
+#   expand_limits(x = c(-6,11), y = c(-7, 20))+
+#   theme_tree2() +
+#   geom_blank()
+  
+
+
+```
+
+
+# Mutation rates (rifampicin test)
+```{r}
+mut_rate_df <- read_delim("~/longterm_abn/2019_three_patients/docs/Tables/20190706_all_rif_test.csv", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+mut_rate_df %>% 
+  mutate(Strain = factor(x = Strain, levels = unique(mut_rate_df$Strain)[c(1:7,10:24,8:9)])) %>%
+  mutate(id = factor(paste(Patient, Strain, sep = "-"))) %>%
+  mutate(Star = if_else(condition = Strain %in% mutators, true = "*", false = "")) %>% 
+  filter(Strain != "5-32") %>%
+  group_by(Patient) %>%
+  # if mutation rate == 0, then value is fixed 
+  # as half the minimum recovered value
+  mutate(mut = if_else(condition = mut > 0, true = mut, false = min(.$mut[.$mut > 0]) / 2 )) %>% 
+  ungroup() %>% 
+  mutate(mut_log = log10(mut)) -> mut_rate_df
+
+highlight_ctrl <-
+  tibble(x_start = 7.5, 
+         x_end = 9.5, 
+         y_start = 0, y_end = Inf)
+
+# get_label_from_id <- function(x){
+#   x_bis <- str_replace(string = x, pattern = "[[:alpha:]]+_{0,1}[0-9]{0,2}-(.*)", replacement = "\\1")
+#   return(x_bis)
+# }
+
+get_label_from_patient <- as_labeller(function(x){
+  x_bis <- str_replace(string = x, pattern = "_", replacement = " ")
+  return(x_bis)
+})
+
+# rif_plot <-
+ggplot() +
+  geom_blank(data = mut_rate_df, mapping = aes(y = mut, x = Strain)) + # sets the scales
+  geom_rect(data = highlight_ctrl, aes(xmin = x_start, xmax = x_end, ymin = y_start, ymax = y_end), 
+            fill = "gray", alpha = 0.2) +
+  geom_boxplot(data = mut_rate_df, mapping = aes(y = mut, x = Strain),
+               outlier.shape = NA) +
+  geom_text(data = mut_rate_df, aes(x = Strain, y = max(mut), label = Star), size = 7) +
+  facet_grid(cols = vars(Patient), scales = "free_x", space = "free_x", labeller = get_label_from_patient) +
+  ylab("Frequency of mutations (log10 scale)") +
+  scale_y_log10() +
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_text(angle = 75, hjust = 1)) +
+  theme(strip.background = element_rect(colour = "black", fill = "white")) +
+  theme() +
+  theme(panel.spacing = unit(1, "lines"))
+# rif_plot
+# save_plot(filename = "~/Desktop/rif_test.pdf", plot = rif_plot, base_aspect_ratio = 2)
+```
+
+## Little stats
+```{r}
+# Convergence PutA - HupA|B
+all_mut %>% 
+  filter(str_detect(gene_name, pattern = "^hup|^putA") | str_detect(gene_product, pattern = "hup[AB]|putA")) %>% 
+  group_by(subclon) %>% 
+  summarize(genotype = paste0(gene_name, collapse = "||"))
+
+print("putA - hupA/B")
+fisher.test(x = matrix(data = c(13,3,0,5), nrow = 2, byrow = TRUE))
+
+
+
+# Mutator association with mutation type (transition vs transversion)
+is_transversion <- 
+  function(nuc_1, nuc_2){
+    pyr_1 <- if_else(condition = nuc_1 %in% c("C", "T"), true = TRUE , false = FALSE)
+    pyr_2 <- if_else(condition = nuc_2 %in% c("C", "T"), true = TRUE , false = FALSE)
+    !(pyr_1 == pyr_2)
+  }
+
+
+all_mut %>% 
+  filter(type == "SNP") %>% 
+  mutate(mutator = subclon %in% mutators) %>% 
+  rowwise() %>% 
+  mutate(nuc_ref = codon_compare(cod_ref = codon_ref_seq, 
+                                 cod_mut = codon_new_seq)[[1]][1]) %>% 
+  mutate(nuc_mut = codon_compare(cod_ref = codon_ref_seq, 
+                                 cod_mut = codon_new_seq)[[2]][1]) %>%
+  ungroup() %>% 
+  mutate(transversion = is_transversion(nuc_1 = nuc_ref, nuc_2 = nuc_mut)) %>% #View
+  select(mutator, transversion, patient) %>% #View
+  table() -> mut_trans_tables
+
+patients <- unique(all_mut$patient)
+print("Association of mutators with transversion")
+for (i in 1:length(patients)){
+  print(patients[i])
+  print(mut_trans_tables[1:2,1:2,i])
+  print(fisher.test(x = mut_trans_tables[1:2,1:2,i]))
+}
+
+
+# Mutator association with small indels
+# all_mut %>% 
+#   # filter(type %in% c("INS","DEL")) %>% 
+#   group_by(patient) %>% 
+#   mutate(small = type %in% c("INS","DEL") & mut_size < 30) %>% 
+#   mutate(mutator = subclon %in% mutators) %>%
+#   ungroup() %>% 
+#   select(small, mutator, patient) %>% 
+#     table() -> asso_small_INDEL
+# 
+# 
+# for (i in 1:length(patients)){
+#   print(patients[i])
+#   print(asso_small_INDEL[1:2,1:2,i])
+#   print(fisher.test(asso_small_INDEL[1:2,1:2,i]))
+# }
+```
+
+# Mice infections & Kaplan-Meier curves
+```{r}
+mice_infection <- read_delim("../data/mice_infections/mice_infection.csv", 
+                             "\t", escape_double = FALSE, trim_ws = TRUE)
+
+mice_infection %>% 
+  mutate(clone = str_replace(string = mice_infection$clone, pattern = "P(5.*)", replacement = "\\1")) %>% 
+  filter(clone != "5-37") %>% 
+  identity() -> mice_infection
+
+
+mice_infection %>% 
+  filter(patient != "patient_11") %>%
+  group_by(patient, clone) %>%
+  summarise(n_death = sum(time < max(time))) %>%
+  # summarise(n_death = sum(n_death > 0) / n()) %>%
+  identity() -> mice_infection_pheno
+
+```
+
+Homemade survival curve plotting
+```{r}
+mice_for_plot <- mice_infection
+# adding time 0 
+for (i in 1:length(unique(mice_for_plot$clone))){
+  curr_clone <- unique(mice_for_plot$clone)[i]
+  curr_patient <- mice_for_plot$patient[mice_for_plot$clone == curr_clone][1]
+  # print(curr_clone)
+  curr_row <- c(0,0,0, curr_clone, curr_patient)
+  mice_for_plot <-
+    add_row(.data = mice_for_plot, time = 0, event = 0, mouse = 0, clone = curr_clone, patient = curr_patient)
+}
+
+mice_for_plot %>% 
+  arrange(time) %>% 
+  filter(patient != "patient_11" & patient != "ctrl") %>%
+  mutate(clone = if_else(condition = clone %in% mutators, true = paste0(clone,"*"), false = clone)) %>% 
+  # filter(clone == "5-35") %>% 
+  group_by(clone) %>% 
+  mutate(lab = if_else(condition = time == max(time), true = clone, false = "")) %>% 
+  mutate(n_mouse = sum(mouse != 0)) %>%
+  mutate(cum_event = cumsum(event)) %>% 
+  group_by(clone, time) %>% 
+  mutate(surv = (n_mouse[1] - max(cum_event)) / n_mouse[1]) %>%
+  slice(1) %>%
+  select(-event, -n_mouse, - cum_event) %>%
+  ungroup() %>%
+  identity() -> mice_for_plot
+
+  ggplot(data = mice_for_plot[mice_for_plot$patient == "patient_13", ], 
+         aes(x = time, y = surv, group = clone)) +
+  geom_step(aes(colour = clone), size = 1.1) +
+  geom_label_repel(mapping = aes(label = lab),
+                   direction = "x",
+                   point.padding = 0, max.iter = 1e4, min.segment.length = 100) +
+  scale_color_grey() +
+  theme(legend.position = "none") +
+  xlab("Time (hours)")   +
+  ylab("Survival probability") +
+  ggtitle(label = "Patient 13", subtitle = "") -> mice_13
+  
+  ggplot(data = mice_for_plot[mice_for_plot$patient == "patient_17", ], 
+         aes(x = time, y = surv, group = clone)) +
+  geom_step(aes(colour = clone), size = 1.1) +
+  geom_label_repel(mapping = aes(label = lab),
+                   direction = "x",
+                   point.padding = 0, max.iter = 1e4, min.segment.length = 100) +
+  scale_color_grey() +
+  theme(legend.position = "none") +
+  xlab("Time (hours)") +
+  ylab("Survival probability") +
+  ggtitle(label = "Patient 17", subtitle = "") -> mice_17
+
+  cowplot::plot_grid(mice_13, mice_17, labels = "")
+```
+
+Using the `survminer` package
+```{r eval=FALSE, include=FALSE}
+fit_13 <- survival::survfit(survival::Surv(time, event) ~ clone, data = filter(mice_infection, patient == "patient_13"))
+plot_surv_13 <- survminer::ggsurvplot(fit = fit_13, data = mice_infection, surv.median.line = "v")[[1]]
+plot_surv_13 <-
+  plot_surv_13 +
+    xlab("") +
+    guides(colour = guide_legend(title = ""))
+  
+  
+fit_17 <- survival::survfit(survival::Surv(time, event) ~ clone, data = filter(mice_infection, patient == "patient_17"))
+plot_surv_17 <- survminer::ggsurvplot(fit = fit_17, data = mice_infection, surv.median.line = "v")[[1]]
+plot_surv_17 <-
+  plot_surv_17 +
+    ylab("") +
+    xlab("") +
+    guides(colour = guide_legend(title = ""))
+
+cowplot::plot_grid(plot_surv_13, plot_surv_17, labels = "AUTO") +
+  draw_label(label = "Time", hjust = 0.6, y = 0.05)
+```
+
+## rpoS mutants competition
+```{r}
+mice_compet <- read_delim("../data/mice_infections/mice_compet_rpoS_infection.csv", 
+                             "\t", escape_double = FALSE, trim_ws = TRUE)
+manip_start <- lubridate::dmy_hms("07-02-2013 14:00:00")
+
+mice_compet %>%
+  filter(! clone %in% c("CFT073", "K12")) %>% 
+  mutate(date = (lubridate::dmy_hms(paste(date, hour_min, sep = " ")))) %>%
+  mutate(time = as.numeric(date - manip_start)) %>% 
+  identity() -> mice_compet
+
+compet_for_plot <- mice_compet
+# adding time 0 
+for (i in 1:length(unique(compet_for_plot$clone))){
+  curr_clone <- unique(compet_for_plot$clone)[i]
+  curr_row <- c(0,0,0, curr_clone)
+  compet_for_plot <-
+    add_row(.data = compet_for_plot, time = 0, event = 0, mouse = 0, clone = curr_clone)
+}
+
+compet_for_plot %>% 
+  arrange(time) %>% 
+  # filter(patient != "patient_11" & patient != "ctrl") %>%
+  # mutate(clone = if_else(condition = clone %in% mutators, true = paste0(clone,"*"), false = clone)) %>% 
+  # filter(clone == "5-35") %>% 
+  group_by(clone) %>% 
+  mutate(lab = if_else(condition = time == max(time), true = clone, false = "")) %>% 
+  mutate(n_mouse = sum(mouse != 0)) %>%
+  mutate(cum_event = cumsum(event)) %>% 
+  group_by(clone, time) %>% 
+  mutate(surv = (n_mouse[1] - max(cum_event)) / n_mouse[1]) %>%
+  slice(1) %>%
+  select(-event, -n_mouse, - cum_event) %>%
+  ungroup() %>%
+  identity() -> compet_for_plot
+
+ggplot(data = compet_for_plot, 
+       aes(x = time, y = surv, group = clone)) +
+  geom_step(aes(colour = clone), size = 1.1) +
+  geom_label_repel(mapping = aes(label = lab),
+                   direction = "x",
+                   point.padding = 0, max.iter = 1e4, min.segment.length = 100) +
+  scale_color_grey() +
+  theme(legend.position = "none") +
+  xlab("Time (hours)") +
+  ylab("Survival probability") +
+  ggtitle(label = "", subtitle = "") -> compet_survplot
+
+compet_survplot
+
+# fit_compet <- survival::survfit(survival::Surv(time, event) ~ clone, data = mice_compet[,])
+# plot_surv_compet <- survminer::ggsurvplot(fit = fit_compet, data = mice_compet)[[1]]
+# plot_surv_compet + xlab("Time (hours)")
+```
+
+
+## Association study
+### Independent mutations
+```{r eval=FALSE, include=FALSE}
+# mutation matrix
+all_subclon_names <- 
+  str_split(string = all_mut$subclon, pattern = "\\|") %>% 
+  unlist() %>% 
+  unique() %>% 
+  c("4250", "4429", "5-35")
+all_mut_matrix <- 
+  make_mut_matrix(mut_table = all_mut, subclon_names = all_subclon_names, letter = TRUE)
+rownames(all_mut_matrix) <- paste("MUT", 1:nrow(all_mut_matrix), sep = "_")
+all_mut_matrix <- as.data.frame(t(all_mut_matrix))
+all_mut_matrix$clone <- rownames(all_mut_matrix)
+all_mut_matrix <- arrange(.data = all_mut_matrix, clone) 
+
+mice_infection_cov <-
+mice_infection %>%
+  filter(patient == "patient_17") %>% 
+  left_join(y = all_mut_matrix, by = c("clone")) %>% 
+  filter(complete.cases(.))
+
+sup_one <- function(x) length(unique(x)) > 1
+mice_infection_cov <-
+  mice_infection_cov[ ,sapply(X = mice_infection_cov, FUN = sup_one )]
+
+# Regression time
+mut_covariates <- names(mice_infection_cov)[-(1:5)]
+formulas <- sapply(mut_covariates,
+                        function(x) as.formula(paste('Surv(time, event)~', x)))
+
+cox_list <- suppressWarnings(
+  lapply(X = formulas, FUN = function(x) coxph(formula = x, data = mice_infection_cov))
+)
+p_list <- unlist(lapply(X = cox_list, FUN = function(x) summary(x)$wald["pvalue"]))
+p_list_corrected <- p.adjust(p = p_list, method = "fdr") # fdr == BH
+
+summary(p_list)
+summary(p_list_corrected)
+
+p_threshold <- 0.001
+cox_list[p_list_corrected <= p_threshold]
+
+all_mut %>%
+  select(patient, subclon, gene_name, gene_product) %>%
+  # filter(patient == "patient_17") %>%
+  mutate(id = as.factor(1:n())) %>%
+  # filter(p_list_corrected <= p_threshold) %>%
+  # View("Signif Mut") %>% 
+  identity()
+# survfit(Surv(time, event) ~ MUT_41, data = mice_infection_cov)
+# fisher.test(x = matrix(c(200,30,10,10), nrow = 2, byrow = TRUE))
+
+```
+
+### associations at gene level
+No strat
+```{r no_strat}
+
+large_del_inter_pattern <- "[–\\/\\[]" # the / is a sign of intergenic_mutation
+
+all_mut %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                                 pattern = "(.*)_[0-9]{1,2}$",
+                                 replacement = "\\1")) %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                               pattern = "-",
+                               replacement = "_")) %>%
+  filter((type == "SNP" & snp_type != "intergenic") | 
+           (type %in% c("DEL", "INS")) & 
+           !str_detect(string = gene_name, pattern = large_del_inter_pattern)) %>% 
+  select(patient, subclon, gene_name, gene_product, type) %>%
+  mutate(clone = str_split(string = subclon, pattern = "\\|")) %>%
+  mutate(gene_name = str_split(string = gene_name, pattern = ";")) %>%
+  mutate(mut = 1) %>% 
+  unnest_longer(col = clone) %>% 
+  unnest_longer(col = gene_name) %>% 
+  select(-subclon, -type, -gene_product, -patient) %>% 
+  distinct() %>%
+  identity() -> all_snp_cov_long
+
+reference_clones <- 
+  data.frame(clone = c("4250", "4429", "5-35"), 
+            stringsAsFactors = FALSE)
+
+all_snp_cov_long %>% 
+  pivot_wider(names_from = gene_name, values_from = mut, values_fill = list(mut = 0), values_fn = list(mut = unique)) %>% 
+  bind_rows(reference_clones) %>% 
+  identity() -> all_snp_cov_wide
+
+all_snp_cov_wide[is.na.data.frame(all_snp_cov_wide)] <- 0
+
+mice_infection %>%
+  filter(patient == "patient_17") %>%
+  filter(clone != "5-37") %>%
+  # select_if(.predicate = function(col) length(unique(col) > 1)) #does not work...
+  left_join(y = all_snp_cov_wide, by = c("clone")) %>%
+  identity() -> mice_infection_cov_gene
+
+sup_one <- function(x) length(unique(x)) > 1
+
+
+mice_infection_cov_gene <-
+  mice_infection_cov_gene[ ,sapply(X = mice_infection_cov_gene, FUN = sup_one )]
+
+# Regression time
+gene_covariates <- names(mice_infection_cov_gene)[c(-1,-2,-3,-4)]
+
+
+formulas_gene <- sapply(gene_covariates,
+                        function(x) as.formula(paste('Surv(time, event)~', x)))
+
+
+
+
+cox_gene_list <- suppressWarnings(
+  lapply(X = formulas_gene, FUN = function(x) coxph(formula = x, data = mice_infection_cov_gene))
+)
+
+p_gene_list <- 
+  unlist(lapply(X = cox_gene_list, FUN = function(x) summary(x)$wald["pvalue"]))
+
+summary(p_gene_list)
+p_gene_list_corrected <- p.adjust(p = p_gene_list, method = "fdr") # fdr == BH
+summary(p_gene_list_corrected)
+p_gene_threshold <- 0.001
+
+# p_gene_list_corrected[p_gene_list_corrected <= p_gene_threshold]
+# cox_gene_list[p_gene_list_corrected <= p_gene_threshold]
+```
+
+Stratification by PCA is not a good idea!
+```{r strat}
+
+large_del_inter_pattern <- "[–\\/\\[]" # the / is a sign of intergenic_mutation
+
+all_mut %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                                 pattern = "(.*)_[0-9]{1,2}$",
+                                 replacement = "\\1")) %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                               pattern = "-",
+                               replacement = "_")) %>%
+  filter((type == "SNP" & snp_type != "intergenic") | 
+           (type %in% c("DEL", "INS")) & 
+           !str_detect(string = gene_name, pattern = large_del_inter_pattern)) %>% 
+  select(patient, subclon, gene_name, gene_product, type) %>%
+  mutate(clone = str_split(string = subclon, pattern = "\\|")) %>%
+  mutate(gene_name = str_split(string = gene_name, pattern = ";")) %>%
+  mutate(mut = 1) %>% 
+  unnest_longer(col = clone) %>% 
+  unnest_longer(col = gene_name) %>% 
+  select(-subclon, -type, -gene_product, -patient) %>% 
+  distinct() %>%
+  identity() -> all_snp_cov_long
+
+reference_clones <- 
+  data.frame(clone = c("4250", "4429", "5-35"), 
+            stringsAsFactors = FALSE)
+
+all_snp_cov_long %>% 
+  pivot_wider(names_from = gene_name, values_from = mut, values_fill = list(mut = 0), values_fn = list(mut = unique)) %>% 
+  bind_rows(reference_clones) %>% 
+  identity() -> all_snp_cov_wide
+
+all_snp_cov_wide[is.na.data.frame(all_snp_cov_wide)] <- 0
+
+mice_infection %>%
+  filter(patient == "patient_17") %>%
+  filter(clone != "5-37") %>%
+  # select_if(.predicate = function(col) length(unique(col) > 1)) #does not work...
+  left_join(y = all_snp_cov_wide, by = c("clone")) %>%
+  identity() -> mice_infection_cov_gene
+
+sup_one <- function(x) length(unique(x)) > 1
+
+
+mice_infection_cov_gene <-
+  mice_infection_cov_gene[ ,sapply(X = mice_infection_cov_gene, FUN = sup_one )]
+
+
+snp_pca <- prcomp(x = (all_snp_cov_wide[, -1]))
+snp_pca <- data.frame(clone = all_snp_cov_wide$clone, 
+                      snp_pca$x[,1:3], 
+                      stringsAsFactors = FALSE)
+mice_infection_cov_gene <-
+  mice_infection_cov_gene %>% 
+    left_join(snp_pca, by = c("clone"))
+
+# Regression time
+
+gene_covariates <- names(mice_infection_cov_gene)[c(4:137)]
+
+
+formulas_gene <- sapply(gene_covariates,
+                        function(x) as.formula(paste('Surv(time, event)~', x, "+PC1+PC2+PC3")))
+
+cox_gene_list <- suppressWarnings(
+  lapply(X = formulas_gene, FUN = function(x) coxph(formula = x, data = mice_infection_cov_gene))
+)
+
+p_gene_list <- 
+  unlist(lapply(X = cox_gene_list, FUN = function(x) coefficients(summary(x))[,5][1]))
+
+summary(p_gene_list)
+p_gene_list_corrected <- p.adjust(p = p_gene_list, method = "fdr") # fdr == BH
+summary(p_gene_list_corrected)
+p_gene_threshold <- 0.01
+
+# p_gene_list_corrected[p_gene_list_corrected <= p_gene_threshold]
+# cox_gene_list[p_gene_list_corrected <= p_gene_threshold]
+```
+
+
+Using only genes that are target of within sample convergence
+```{r}
+all_mut %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                                 pattern = "(.*)_[0-9]{1,2}$",
+                                 replacement = "\\1")) %>%
+  mutate(gene_name = str_replace(string = gene_name,
+                               pattern = "-",
+                               replacement = "_")) %>%
+  filter((type == "SNP" & snp_type != "intergenic") | 
+           (type %in% c("DEL", "INS")) & 
+           !str_detect(string = gene_name, pattern = large_del_inter_pattern)) %>% 
+  select(patient, subclon, gene_name, gene_product, type) %>%
+  group_by(patient, gene_name) %>% 
+  mutate(within_n = n()) %>%
+  filter(within_n > 1) %>% 
+  ungroup() %>% 
+  mutate(clone = str_split(string = subclon, pattern = "\\|")) %>%
+  mutate(gene_name = str_split(string = gene_name, pattern = ";")) %>%
+  mutate(mut = 1) %>% 
+  unnest_longer(col = clone) %>% 
+  unnest_longer(col = gene_name) %>% 
+  select(-subclon, -type, -gene_product, -patient, -within_n) %>% 
+  distinct() %>%
+  pivot_wider(names_from = gene_name, values_from = mut, values_fill = list(mut = 0), values_fn = list(mut = unique)) %>% 
+  bind_rows(reference_clones) %>%
+  mutate_all(.funs = function(x) ifelse(is.na(x), 0, x)) %>% 
+  identity() -> all_mut_within_wide
+
+mice_infection %>%
+  filter(patient == "patient_13") %>% # patient_17
+  filter(clone != "5-37") %>%
+  # select_if(.predicate = function(col) length(unique(col) > 1)) #does not work...
+  left_join(y = all_mut_within_wide, by = c("clone")) %>%
+  mutate_all(.funs = function(x) ifelse(is.na(x), 0, x)) %>% 
+  identity() -> mice_infection_cov_within
+
+sup_one <- function(x) length(unique(x)) > 1
+mice_infection_cov_within <-
+  mice_infection_cov_within[ ,sapply(X = mice_infection_cov_within, FUN = sup_one )]
+
+# Regression time
+within_covariates <- names(mice_infection_cov_within)[c(-1,-2,-3,-4)]
+
+
+formulas_within <- sapply(within_covariates,
+                        function(x) as.formula(paste('Surv(time, event)~', x)))
+
+cox_within_list <- suppressWarnings(
+  lapply(X = formulas_within, FUN = function(x) coxph(formula = x, data = mice_infection_cov_within))
+)
+
+p_within_list <- 
+  unlist(lapply(X = cox_within_list, FUN = function(x) summary(x)$wald["pvalue"]))
+summary(p_within_list)
+p_within_list_corrected <- p.adjust(p = p_within_list, method = "fdr") # fdr == BH
+summary(p_within_list_corrected)
+p_within_threshold <- 0.01
+
+# p_within_list_corrected[p_within_list_corrected <= p_within_threshold]
+# cox_within_list[p_within_list_corrected <= p_within_threshold]
+
+```
+
+# rpoS mutants survival
+```{r}
+rpos_mut <- 
+  read_tsv(file = "../data/rpoS/rpos_mutants_surv.csv", col_names = TRUE)
+
+ggplot(data = rpos_mut,
+       aes(x = time, y = surv, group = mutant, colour = mutant)) +
+  geom_line() +
+  geom_point() +
+  # scale_y_log10(label = c("0", "0.1%","1%","10%","100%"), breaks = c(0, 0.1, 1, 10,100)) +
+  scale_y_log10(label = c("0", "0.01%", "0.1%","1%","10%","100%"), breaks = c(0, 0.01, 0.1, 1, 10,100)) +
+  xlab("Time (min)") +
+  ylab("Cell survival (%)") +
+  labs(colour = "Patient 17\n5-35 mutant") +
+  theme(legend.title.align=0.5) +
+  # ylim(c(0.1, 1e2))
+  geom_blank()
+
+ggplot(data = rpos_mut,
+       aes(x = time, y = surv, group = mutant, colour = mutant)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(label = paste0(seq(0,100,20), "%"), breaks = seq(0,100,20)) +
+  xlab("Time (min)") +
+  ylab("Cell survival (%)") +
+  labs(colour = "5-35 mutant") +
+  # ylim(c(0.1, 1e2))
+  geom_blank()
+```
+
